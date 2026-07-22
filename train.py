@@ -1,6 +1,6 @@
-import math
-import time
-from pathlib import Path
+import json
+import os
+import random
 
 import numpy as np
 import pandas as pd
@@ -8,14 +8,30 @@ import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
 
-from data import TrainingPatchDataset
-from inference import evaluate_records
-from losses import build_loss
-from model import StandardUNet
-from utils import save_json, seed_worker, set_seed
+import config as cfg
+from dataset import PatchDataset, pair_files, positions, read_image, read_mask, split_train_val
+from loss_metric import BCEClDice, BCEDice, BCEOnly, ThinAuxLoss
+from loss_metric import auc_value, cldice_score, dice_score, precision_score
+from loss_metric import sensitivity_score, specificity_score, thin_recall
+from model import UNet
 
 
-def thin_mode(loss_name: str) -> str:
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def get_device():
+    if cfg.DEVICE == "cuda" and torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+
+def get_thin_type(loss_name):
     if loss_name == "thinaux_fixed":
         return "fixed"
     if loss_name == "thinaux_adaptive":
@@ -23,203 +39,220 @@ def thin_mode(loss_name: str) -> str:
     return "none"
 
 
-def train_one_epoch(model, loader, criterion, optimizer, device):
-    model.train()
-    losses = []
-
-    for images, targets, thin_masks in loader:
-        images = images.to(device, non_blocking=True)
-        targets = targets.to(device, non_blocking=True)
-        thin_masks = thin_masks.to(device, non_blocking=True)
-
-        optimizer.zero_grad(set_to_none=True)
-        logits = model(images)
-        loss = criterion(logits, targets, thin_masks)
-
-        if not torch.isfinite(loss):
-            raise FloatingPointError(f"Non-finite loss: {loss.item()}")
-
-        loss.backward()
-        optimizer.step()
-        losses.append(float(loss.item()))
-
-    return float(np.mean(losses))
+def count_pos_weight(dataset):
+    pos = 0
+    neg = 0
+    for _, _, mask, _ in dataset.images:
+        pos += (mask == 1).sum()
+        neg += (mask == 0).sum()
+    return float(neg / (pos + 1e-8))
 
 
-def train_single_run(
-    args,
-    loss_name,
-    seed,
-    train_records,
-    val_records,
-    test_records,
-):
+def get_loss(loss_name, dataset, device):
+    if loss_name == "bce":
+        return BCEOnly(), "BCE"
+    if loss_name == "bce_dice":
+        return BCEDice(), "BCE+Dice"
+    if loss_name == "bce_cldice":
+        return BCEClDice(), "BCE+clDice"
+    if loss_name == "weighted_bce":
+        value = count_pos_weight(dataset)
+        weight = torch.tensor([value], dtype=torch.float32, device=device)
+        return BCEOnly(weight), "Weighted BCE"
+    if loss_name == "thinaux_fixed":
+        return ThinAuxLoss(cfg.ALPHA), "Fixed ThinAux"
+    if loss_name == "thinaux_adaptive":
+        return ThinAuxLoss(cfg.ALPHA), "Adaptive ThinAux"
+    raise ValueError(loss_name)
+
+
+def predict_image(model, img, device):
+    patch_size = cfg.PATCH_SIZE
+    stride = cfg.STRIDE
+    h0, w0 = img.shape[:2]
+    ph = max(0, patch_size - h0)
+    pw = max(0, patch_size - w0)
+
+    if ph > 0 or pw > 0:
+        img = np.pad(img, ((0, ph), (0, pw), (0, 0)), mode="reflect")
+
+    h, w = img.shape[:2]
+    result = np.zeros((h, w), dtype=np.float32)
+    count = np.zeros((h, w), dtype=np.float32)
+    patches = []
+    coords = []
+
+    def run_batch():
+        if len(patches) == 0:
+            return
+        batch = torch.stack(patches).to(device)
+        with torch.no_grad():
+            prob = torch.sigmoid(model(batch)).cpu().numpy()[:, 0]
+        for p, (y, x) in zip(prob, coords):
+            result[y:y + patch_size, x:x + patch_size] += p
+            count[y:y + patch_size, x:x + patch_size] += 1
+        patches.clear()
+        coords.clear()
+
+    for y in positions(h, patch_size, stride):
+        for x in positions(w, patch_size, stride):
+            patch = img[y:y + patch_size, x:x + patch_size]
+            patch = torch.tensor(patch.transpose(2, 0, 1), dtype=torch.float32)
+            patches.append(patch)
+            coords.append((y, x))
+            if len(patches) == 4:
+                run_batch()
+
+    run_batch()
+    result = result / np.maximum(count, 1)
+    return result[:h0, :w0]
+
+
+def evaluate(model, data, device):
+    rows = []
+    model.eval()
+
+    for name, img_path, mask_path in data:
+        img = read_image(img_path)
+        gt = read_mask(mask_path)
+        prob = predict_image(model, img, device)
+        pred = (prob >= cfg.PRED_THRESHOLD).astype(np.float32)
+
+        rows.append({
+            "image": name,
+            "Dice": dice_score(pred, gt),
+            "Precision": precision_score(pred, gt),
+            "Sensitivity": sensitivity_score(pred, gt),
+            "Specificity": specificity_score(pred, gt),
+            "AUC": auc_value(prob, gt),
+            "Thin_Recall": thin_recall(pred, gt, cfg.THIN_THRESHOLD),
+            "clDice": cldice_score(pred, gt),
+        })
+
+    df = pd.DataFrame(rows)
+    result = {}
+    for col in ["Dice", "Precision", "Sensitivity", "Specificity", "AUC", "Thin_Recall", "clDice"]:
+        result[col] = float(np.nanmean(df[col].values))
+    return result, df
+
+
+def train_one(loss_name, seed, train_data, val_data, test_data):
     set_seed(seed)
+    device = get_device()
 
-    device = torch.device(
-        "cuda"
-        if args.device == "auto" and torch.cuda.is_available()
-        else args.device
-        if args.device != "auto"
-        else "cpu"
+    dataset = PatchDataset(
+        train_data,
+        patch_size=cfg.PATCH_SIZE,
+        stride=cfg.STRIDE,
+        thin_type=get_thin_type(loss_name),
+        threshold=cfg.THIN_THRESHOLD,
+        percentile=cfg.ADAPTIVE_PERCENTILE,
+        augment=True,
     )
 
-    training_dataset = TrainingPatchDataset(
-        train_records,
-        args.patch_size,
-        args.train_stride,
-        thin_mode(loss_name),
-        args.fixed_threshold,
-        args.adaptive_percentile,
-        args.augment,
-    )
-
-    generator = torch.Generator()
-    generator.manual_seed(seed)
-
-    train_loader = DataLoader(
-        training_dataset,
-        batch_size=args.batch_size,
+    loader = DataLoader(
+        dataset,
+        batch_size=cfg.BATCH_SIZE,
         shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=device.type == "cuda",
-        worker_init_fn=seed_worker,
-        generator=generator,
-        persistent_workers=args.num_workers > 0,
+        num_workers=cfg.NUM_WORKERS,
     )
 
-    model = StandardUNet().to(device)
-    criterion, display_name = build_loss(
-        loss_name,
-        args,
-        training_dataset,
-        device,
-    )
+    model = UNet().to(device)
+    criterion, method_name = get_loss(loss_name, dataset, device)
     criterion = criterion.to(device)
+    optimizer = optim.Adam(model.parameters(), lr=cfg.LR)
 
-    optimizer = optim.Adam(
-        model.parameters(),
-        lr=args.learning_rate,
-        weight_decay=args.weight_decay,
-    )
+    run_dir = os.path.join(cfg.OUTPUT_DIR, loss_name + "_seed" + str(seed))
+    os.makedirs(run_dir, exist_ok=True)
 
-    run_name = f"{args.dataset}_{loss_name}_seed{seed}"
-    run_dir = Path(args.output_dir) / run_name
-    run_dir.mkdir(parents=True, exist_ok=True)
+    best_dice = -1
+    best_epoch = 0
+    history = []
 
-    config = vars(args).copy()
-    config.update(
-        {
-            "loss_name": loss_name,
-            "display_name": display_name,
-            "seed": seed,
-            "resolved_device": str(device),
-            "train_images": [record.sample_id for record in train_records],
-            "val_images": [record.sample_id for record in val_records],
-            "test_images": [record.sample_id for record in test_records],
-            "training_patch_count": len(training_dataset),
-        }
-    )
-    save_json(config, run_dir / "config.json")
+    for epoch in range(1, cfg.EPOCHS + 1):
+        model.train()
+        losses = []
 
-    history_rows = []
-    best_val_dice = -math.inf
-    best_epoch = -1
-    best_checkpoint_path = run_dir / "best_model.pt"
-    start_time = time.time()
+        for img, mask, thin in loader:
+            img = img.to(device)
+            mask = mask.to(device)
+            thin = thin.to(device)
+            optimizer.zero_grad()
+            logits = model(img)
+            loss = criterion(logits, mask, thin)
+            loss.backward()
+            optimizer.step()
+            losses.append(loss.item())
 
-    for epoch in range(1, args.epochs + 1):
-        train_loss = train_one_epoch(
-            model,
-            train_loader,
-            criterion,
-            optimizer,
-            device,
-        )
+        train_loss = float(np.mean(losses))
+        val_result, val_df = evaluate(model, val_data, device)
+        history.append({
+            "epoch": epoch,
+            "loss": train_loss,
+            "val_dice": val_result["Dice"],
+            "val_thin_recall": val_result["Thin_Recall"],
+        })
 
-        if epoch % args.validation_every == 0 or epoch == args.epochs:
-            val_metrics, val_per_image = evaluate_records(
-                model,
-                val_records,
-                device,
-                args.patch_size,
-                args.inference_stride,
-                args.inference_batch_size,
-                args.prediction_threshold,
-                args.evaluation_thin_threshold,
-                args.cldice_iterations,
-            )
+        print(loss_name, seed, epoch, train_loss, val_result["Dice"])
 
-            history_rows.append(
-                {
-                    "epoch": epoch,
-                    "train_loss": train_loss,
-                    **{f"val_{key}": value for key, value in val_metrics.items()},
-                    "elapsed_seconds": time.time() - start_time,
-                }
-            )
+        if val_result["Dice"] > best_dice:
+            best_dice = val_result["Dice"]
+            best_epoch = epoch
+            torch.save(model.state_dict(), os.path.join(run_dir, "best_model.pt"))
+            val_df.to_csv(os.path.join(run_dir, "best_val_result.csv"), index=False)
 
-            print(
-                f"{run_name} | {epoch:03d}/{args.epochs} | "
-                f"{train_loss:.6f} | {val_metrics['Dice']:.4f} | "
-                f"{val_metrics['Thin_Recall']:.4f}"
-            )
+    pd.DataFrame(history).to_csv(os.path.join(run_dir, "history.csv"), index=False)
 
-            if val_metrics["Dice"] > best_val_dice:
-                best_val_dice = val_metrics["Dice"]
-                best_epoch = epoch
+    model.load_state_dict(torch.load(os.path.join(run_dir, "best_model.pt"), map_location=device))
+    test_result, test_df = evaluate(model, test_data, device)
+    test_df.to_csv(os.path.join(run_dir, "test_result_per_image.csv"), index=False)
 
-                torch.save(
-                    {
-                        "epoch": epoch,
-                        "model_state": model.state_dict(),
-                        "optimizer_state": optimizer.state_dict(),
-                        "validation_metrics": val_metrics,
-                        "config": config,
-                    },
-                    best_checkpoint_path,
-                )
+    test_result["method"] = method_name
+    test_result["loss_name"] = loss_name
+    test_result["seed"] = seed
+    test_result["best_epoch"] = best_epoch
+    test_result["best_val_dice"] = best_dice
 
-                val_per_image.to_csv(
-                    run_dir / "best_validation_per_image.csv",
-                    index=False,
-                )
+    with open(os.path.join(run_dir, "test_summary.json"), "w") as f:
+        json.dump(test_result, f, indent=2)
 
-    pd.DataFrame(history_rows).to_csv(
-        run_dir / "training_history.csv",
-        index=False,
-    )
+    return test_result
 
-    checkpoint = torch.load(best_checkpoint_path, map_location=device)
-    model.load_state_dict(checkpoint["model_state"])
 
-    test_metrics, test_per_image = evaluate_records(
-        model,
-        test_records,
-        device,
-        args.patch_size,
-        args.inference_stride,
-        args.inference_batch_size,
-        args.prediction_threshold,
-        args.evaluation_thin_threshold,
-        args.cldice_iterations,
-        run_dir / "test_predictions" if args.save_predictions else None,
-    )
+def main():
+    os.makedirs(cfg.OUTPUT_DIR, exist_ok=True)
+    all_train = pair_files(cfg.TRAIN_IMG, cfg.TRAIN_MASK)
+    test_data = pair_files(cfg.TEST_IMG, cfg.TEST_MASK)
+    train_data, val_data = split_train_val(all_train, cfg.VAL_RATIO, cfg.SPLIT_SEED)
 
-    test_per_image.to_csv(
-        run_dir / "test_metrics_per_image.csv",
-        index=False,
-    )
+    with open(os.path.join(cfg.OUTPUT_DIR, "split.json"), "w") as f:
+        json.dump({
+            "train": [x[0] for x in train_data],
+            "val": [x[0] for x in val_data],
+            "test": [x[0] for x in test_data],
+        }, f, indent=2)
 
-    result = {
-        "dataset": args.dataset,
-        "loss_key": loss_name,
-        "method": display_name,
-        "seed": seed,
-        "best_epoch": best_epoch,
-        "best_validation_Dice": best_val_dice,
-        **test_metrics,
-    }
+    methods = [
+        "bce",
+        "bce_dice",
+        "bce_cldice",
+        "weighted_bce",
+        "thinaux_fixed",
+        "thinaux_adaptive",
+    ]
 
-    save_json(result, run_dir / "test_summary.json")
-    return result
+    results = []
+
+    for method in methods:
+        for seed in cfg.SEEDS:
+            result = train_one(method, seed, train_data, val_data, test_data)
+            results.append(result)
+            pd.DataFrame(results).to_csv(os.path.join(cfg.OUTPUT_DIR, "all_results.csv"), index=False)
+
+    df = pd.DataFrame(results)
+    df.groupby("method").mean(numeric_only=True).to_csv(os.path.join(cfg.OUTPUT_DIR, "mean_result.csv"))
+    df.groupby("method").std(numeric_only=True).to_csv(os.path.join(cfg.OUTPUT_DIR, "std_result.csv"))
+
+
+if __name__ == "__main__":
+    main()
