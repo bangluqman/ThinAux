@@ -14,19 +14,19 @@ def parse_args():
 
     parser.add_argument(
         "--train-img",
-        default="/home/server-ai/LUKMAN PROJECT/FUNDUS/DRIVE/training/images/*",
+        default="training/images/*",
     )
     parser.add_argument(
         "--train-mask",
-        default="/home/server-ai/LUKMAN PROJECT/FUNDUS/DRIVE/training/1st_manual/*",
+        default="training/1st_manual/*",
     )
     parser.add_argument(
         "--test-img",
-        default="/home/server-ai/LUKMAN PROJECT/FUNDUS/DRIVE/test/images/*",
+        default="test/images/*",
     )
     parser.add_argument(
         "--test-mask",
-        default="/home/server-ai/LUKMAN PROJECT/FUNDUS/DRIVE/test/1st_manual/*",
+        default="test/1st_manual/*",
     )
 
     parser.add_argument("--all-img", default="")
